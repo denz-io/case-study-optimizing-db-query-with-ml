@@ -1,0 +1,31 @@
+{
+  "_comment": [
+    "Stand-in for the decision tree trained offline (Section III.E). It predicts",
+    "whether a unit is likely to sell within 90 days (target class 1) from columns",
+    "that are all available to the listing query. Same shape as a scikit-learn",
+    "tree export: left branch = feature <= threshold, right branch = feature > threshold."
+  ],
+  "target_class": 1,
+  "features": ["price", "level_order", "total_area", "price_m2", "aspect_order"],
+  "tree": {
+    "feature": "price", "threshold": 1200000,
+    "left": {
+      "feature": "level_order", "threshold": 15,
+      "left": {
+        "feature": "total_area", "threshold": 60,
+        "left": {
+          "feature": "price_m2", "threshold": 11000,
+          "left":  {"class": 1},
+          "right": {"class": 0}
+        },
+        "right": {
+          "feature": "aspect_order", "threshold": 5,
+          "left":  {"class": 1},
+          "right": {"class": 0}
+        }
+      },
+      "right": {"class": 0}
+    },
+    "right": {"class": 0}
+  }
+}

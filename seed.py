@@ -201,6 +201,7 @@ def main():
         insert(out, "products", products)
         insert(out, "items", items)
         out.write("SET FOREIGN_KEY_CHECKS = 1;\n")
+        out.write("ANALYZE TABLE `projects`, `stages`, `products`, `items`;\n")
     print(f"projects={len(projects)} stages={len(stages)} products={len(products)} items={len(items)}", file=sys.stderr)
 
 

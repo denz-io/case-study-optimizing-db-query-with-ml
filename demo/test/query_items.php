@@ -1,175 +1,379 @@
 #!/usr/bin/env php
 <?php
 /**
- * Unit listing query from the original codebase (UnitRepository::findUnits /
- * searchUnits), translated onto the anonymised `unitledger` schema:
- *   elements -> items, element_id -> item_id, fir_b -> fi_a
- * Tables that were pruned from the demo schema (packages, agencies) and the
- * filters that depended on them (packageConfig, agency.code search) are left out.
+ * Baseline vs Smart-inspired predicate generation (case study, Section III),
+ * measured on the emulated matrix-advance endpoint (demo/test/matrix-endpoint.php).
  *
- *   php demo/test/query_items.php --project=SLUG [filters] [--show] [--explain]
+ *   baseline  the endpoint as it is: findUnits()/arrangeFilter() in MySQL, every
+ *             returned unit hydrated and scored by the decision tree in the element loop
+ *   proposed  the same endpoint with SQL predicates derived from the tree added to the
+ *             units query, so MySQL discards records that cannot satisfy the ML
+ *             predicate before returning them; the tree still scores what remains
  *
- *   --project=SLUG      project title_canonical (required; resolved to its id)
- *                       e.g. harbourline-residences, elm-street-village, riverbend-estate
- *   --status=a,b        units.status IN (...)
- *   --aspect=N,NE       units.aspect IN (...)
- *   --bed="2 Bed 2 Bath"  product.name IN (...)   (comma separated)
- *   --fia=0|1           reservations.fi_a IN (...)
- *   --agency=ID         reservations.agency_id IN (...) AND reservations.status = 'accepted'
- *   --upgrade=NAME      contract_upgrade.name IN (...) AND contract_upgrade.type = 'upgrade'
- *   --min-area=N        units.total_area >= N   (total_lot_area for land projects)
- *   --max-area=N        units.total_area <= N
- *   --block=ID          units.block_id IN (...)
- *   --extra-config=X    extras.configuration IN (...)
- *   --search=TERM       stock_id / level / classification LIKE '%TERM%'
- *   --show              print the result rows (default: rows are counted only)
- *   --explain           also print the EXPLAIN plan
- *   --db=NAME           database (default: MYSQL_DATABASE or unitledger)
+ * Both share the dataset, schema, indexes, model, viewer and request. Each run
+ * builds the full response (query, hydration, filter loop, element construction,
+ * JSON encoding) and records the paper's metrics: query execution time from the
+ * Performance Schema, total processing time, rows examined / returned / scored,
+ * result correctness (hash of the sorted element ids), peak memory. The order of
+ * the configurations alternates between runs.
  *
- * Connection: MYSQL_HOST (127.0.0.1), MYSQL_PORT (3307), root / MYSQL_ROOT_PASSWORD (root).
+ *   php demo/test/query_items.php --project=SLUG [--request=QUERY] [options]
+ *
+ *   --project=SLUG        project title_canonical (required)
+ *                         harbourline-residences | elm-street-village | riverbend-estate
+ *   --request=QUERY       the endpoint's query string, e.g.
+ *                         'filters=1&statusName=available,sold&aspect=N,NE&bedConfig=2 Bed 2 Bath|3 Bed 2 Bath'
+ *                         'filters=1&unitTotalAreaList=80-150&block=A'   'search=H03'   'isMatrix=true'
+ *   --as=admin|agent --agency=ID --email=EMAIL   the viewer (session user in production)
+ *   --predicates=atomic   per-column bounds across all target-class paths (default)
+ *   --predicates=composite  OR of the full root-to-leaf conjunctions (tight predicate)
+ *   --config=both|baseline|proposed   which configurations to run (default both)
+ *   --warmup=5 --runs=30  warm-up and measured executions per configuration
+ *   --explain             print EXPLAIN for both units queries
+ *   --json                emit the full measurement set as JSON after the report
+ *
+ * Environment: MYSQL_HOST, MYSQL_PORT, MYSQL_DATABASE, MYSQL_ROOT_PASSWORD, ML_MODEL.
  */
 declare(strict_types=1);
 
-$opts = getopt('h', [
-    'project:', 'status:', 'aspect:', 'bed:', 'fia:', 'agency:', 'upgrade:',
-    'min-area:', 'max-area:', 'block:', 'extra-config:', 'search:',
-    'show', 'explain', 'db:', 'help',
-]);
+require_once __DIR__ . '/ml.php';
+require_once __DIR__ . '/matrix-endpoint.php';
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+$opts = getopt('h', ['project:', 'request:', 'as:', 'agency:', 'email:', 'predicates:', 'config:',
+    'warmup:', 'runs:', 'explain', 'json', 'help']);
 if (isset($opts['h']) || isset($opts['help'])) {
     $lines = file(__FILE__);
-    echo implode('', array_map(fn ($l) => preg_replace('/^ \* ?/', '', $l), array_slice($lines, 3, 27)));
+    echo implode('', array_map(fn ($l) => preg_replace('/^ \* ?/', '', $l), array_slice($lines, 3, 33)));
     exit(0);
 }
-$project = $opts['project'] ?? null;
-if ($project === null || $project === '') {
-    fwrite(STDERR, "usage: {$argv[0]} --project=SLUG [filters]  (see --help)\n");
+$project = $opts['project'] ?? '';
+if ($project === '') {
+    fwrite(STDERR, "usage: {$argv[0]} --project=SLUG [--request=QUERY] [options]  (see --help)\n");
     exit(1);
 }
+$predMode = $opts['predicates'] ?? 'atomic';
+if (!in_array($predMode, ['atomic', 'composite'], true)) {
+    fwrite(STDERR, "--predicates must be atomic or composite\n");
+    exit(1);
+}
+$configs = match ($opts['config'] ?? 'both') {
+    'baseline' => ['baseline'],
+    'proposed' => ['proposed'],
+    default    => ['baseline', 'proposed'],
+};
+$warmup = (int) ($opts['warmup'] ?? 5);
+$runs   = max(1, (int) ($opts['runs'] ?? 30));
 
-$host = getenv('MYSQL_HOST') ?: '127.0.0.1';
-$port = getenv('MYSQL_PORT') ?: '3307';
-$db   = $opts['db'] ?? (getenv('MYSQL_DATABASE') ?: 'unitledger');
-$pw   = getenv('MYSQL_ROOT_PASSWORD') ?: 'root';
+parse_str($opts['request'] ?? '', $request);
+$request['_as'] = $opts['as'] ?? ($request['_as'] ?? 'admin');
+if (isset($opts['agency'])) $request['_agency'] = $opts['agency'];
+if (isset($opts['email']))  $request['_email']  = $opts['email'];
+$viewer = viewerFromQuery($request);
 
-$pdo = new PDO("mysql:host=$host;port=$port;dbname=$db;charset=utf8mb4", 'root', $pw, [
-    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
-    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-    PDO::ATTR_EMULATE_PREPARES   => false,   // server-side prepares, like the original
-]);
+$pdo = db();
+$threadId = (int) $pdo->query(
+    'SELECT THREAD_ID FROM performance_schema.threads WHERE PROCESSLIST_ID = CONNECTION_ID()'
+)->fetchColumn();
 
-/** Split "a,b,c" into a list; empty option -> empty list. */
-$list = static fn (?string $v): array => $v === null || $v === '' ? [] : array_map('trim', explode(',', $v));
-
-// The original binds :project to the project id; resolve the slug the same way.
-$st = $pdo->prepare('SELECT id, type FROM projects WHERE title_canonical = :slug');
-$st->execute([':slug' => $project]);
-$proj = $st->fetch();
-if ($proj === false) {
+$proj = loadProject($project);
+if ($proj === null) {
     fwrite(STDERR, "no project with title_canonical '$project'\n");
     exit(1);
 }
-$projectId = $proj['id'];
-$areaCol   = $proj['type'] === 'land' ? 'total_lot_area' : 'total_area';
-$search    = $opts['search'] ?? null;
-
-// --- base query (list path) ------------------------------------------------
-$select = 'units.*, reservations.*, allocations.*, product.*, extras.*';
-$joins  = <<<SQL
-  LEFT JOIN contract_upgrades contract_upgrade ON units.id = contract_upgrade.item_id
-  LEFT JOIN reservations reservations          ON units.id = reservations.item_id
-  LEFT JOIN allocations allocations            ON units.id = allocations.item_id
-  LEFT JOIN products product                   ON units.product_id = product.id
-  LEFT JOIN extras extras                      ON units.id = extras.item_id
-SQL;
-$where  = ["units.project_id = :project", "units.discr IN ('unit')"];
-$params = [':project' => $projectId];
-
-// --- search path overrides joins/select and adds the LIKE clauses -----------
-if ($search !== null && $search !== '') {
-    $select = 'units.*, reservations.*, allocations.*';
-    $joins  = <<<SQL
-  LEFT JOIN reservations reservations ON units.id = reservations.item_id
-  LEFT JOIN allocations allocations   ON units.id = allocations.item_id
-SQL;
-    // Native prepares need a distinct placeholder per occurrence.
-    $where[] = "(units.stock_id LIKE :term1\n         OR units.level LIKE :term2\n         OR units.classification LIKE :term3)";
-    $params += [':term1' => "%$search%", ':term2' => "%$search%", ':term3' => "%$search%"];
+if ($viewer['isAgent'] && empty($proj['agencyPermissions'][$viewer['agency']])) {
+    fwrite(STDERR, "agent viewer needs --agency=ID\n");
+    exit(1);
 }
 
-// --- arrangeFilter(): each clause only when its filter is set ---------------
-$n = 0;
-/** Build "IN (:p0, :p1, ...)" and register the bound values. */
-$in = static function (array $values) use (&$params, &$n): string {
-    $names = [];
-    foreach ($values as $v) {
-        $name = ':p' . $n++;
-        $names[] = $name;
-        $params[$name] = $v;
+// ---------------------------------------------------------------------------
+// Model, predicates and the validity check over the full dataset (Section III.E)
+// ---------------------------------------------------------------------------
+$model = mlModel();
+$pred  = mlPredicates($model, $predMode);
+
+$featureCols = implode(', ', array_map(fn ($f) => "units.$f", $model['features']));
+$all = $pdo->query("SELECT units.id, $featureCols FROM items units")->fetchAll();
+$predictedIds = [];
+foreach ($all as $r) if (mlAccepts($model, $r)) $predictedIds[$r['id']] = true;
+if ($pred['sql'] !== '') {
+    $st = $pdo->prepare("SELECT units.id FROM items units WHERE {$pred['sql']}");
+    $st->execute($pred['params']);
+    $allowedIds = array_fill_keys($st->fetchAll(PDO::FETCH_COLUMN), true);
+} else {
+    $allowedIds = array_fill_keys(array_column($all, 'id'), true);
+}
+$excluded = array_diff_key($predictedIds, $allowedIds);
+$validity = [
+    'records'          => count($all),
+    'model_target'     => count($predictedIds),
+    'predicate_allows' => count($allowedIds),
+    'wrongly_excluded' => count($excluded),
+];
+if ($excluded !== []) {
+    fwrite(STDERR, "predicate validity check FAILED: {$validity['wrongly_excluded']} target-class records excluded\n");
+    exit(2);
+}
+
+// The two endpoint requests: identical apart from the ML-derived predicates.
+$requests = [
+    'baseline' => $request + ['_ml' => '1'],
+    'proposed' => $request + ['_ml' => '1', '_predicates' => $predMode],
+];
+
+// ---------------------------------------------------------------------------
+// Measurement
+// ---------------------------------------------------------------------------
+/** Performance Schema figures for the units query (a statement/com/Execute event). */
+function perfSchema(PDO $pdo, int $threadId): array
+{
+    // blockOrder() runs a prepared statement after the units query, so take the
+    // Execute event with the most rows examined among the last few on this thread.
+    $rows = $pdo->query(
+        "SELECT TIMER_WAIT, ROWS_EXAMINED, ROWS_SENT, CREATED_TMP_TABLES, SORT_ROWS, NO_INDEX_USED
+           FROM performance_schema.events_statements_history
+          WHERE THREAD_ID = $threadId AND EVENT_NAME = 'statement/com/Execute'
+          ORDER BY EVENT_ID DESC LIMIT 3"
+    )->fetchAll();
+    if ($rows === []) return [];
+    usort($rows, fn ($a, $b) => $b['ROWS_EXAMINED'] <=> $a['ROWS_EXAMINED']);
+    $r = $rows[0];
+    return [
+        'query_ms'      => ((int) $r['TIMER_WAIT']) / 1e9,   // TIMER_WAIT is picoseconds
+        'rows_examined' => (int) $r['ROWS_EXAMINED'],
+        'rows_sent'     => (int) $r['ROWS_SENT'],
+        'tmp_tables'    => (int) $r['CREATED_TMP_TABLES'],
+        'sort_rows'     => (int) $r['SORT_ROWS'],
+        'no_index_used' => (int) $r['NO_INDEX_USED'],
+    ];
+}
+
+/** One request through the endpoint: build the response, encode it, collect metrics. */
+function runOnce(PDO $pdo, int $threadId, array $project, array $viewer, array $request): array
+{
+    $GLOBALS['matrix']['timing'] = [];
+    $t0 = hrtime(true);
+    $data = buildMatrix($project, $viewer, $request);
+    $t1 = hrtime(true);
+    $body = json_encode(['data' => $data], JSON_OPTIONS);
+    $t2 = hrtime(true);
+
+    $ids = [];
+    foreach ($data['levels']['data'] as $level) {
+        foreach ($level['elements']['data'] as $el) $ids[] = $el['id'];
     }
-    return 'IN (' . implode(', ', $names) . ')';
-};
-$isList = ($search === null || $search === '');
+    sort($ids, SORT_STRING);
+    $t = $GLOBALS['matrix']['timing'];
+    return [
+        'execute_ms' => $t['execute_ms'],
+        'fetch_ms'   => $t['fetch_ms'],          // transfer + hydration
+        'build_ms'   => $t['build_ms'],          // ML scoring, agent filter, element construction
+        'encode_ms'  => ($t2 - $t1) / 1e6,
+        'total_ms'   => ($t2 - $t0) / 1e6,
+        'joined_rows'=> $t['rows'],
+        'units'      => $t['units'],
+        'scored'     => $t['scored'],
+        'result'     => count($ids),
+        'bytes'      => strlen($body),
+        'hash'       => hash('sha256', implode("\n", $ids)),
+        'peak_mb'    => memory_get_peak_usage(true) / 1048576,
+    ] + perfSchema($pdo, $threadId);
+}
 
-if ($v = $list($opts['status'] ?? null))   $where[] = 'units.status ' . $in($v);
-if ($v = $list($opts['aspect'] ?? null))   $where[] = 'units.aspect ' . $in($v);
-if ($v = $list($opts['fia'] ?? null))      $where[] = 'reservations.fi_a ' . $in($v);
-if ($isList && ($v = $list($opts['bed'] ?? null)))
-    $where[] = 'product.name ' . $in($v);
-if ($isList && ($v = $list($opts['upgrade'] ?? null)))
-    $where[] = 'contract_upgrade.name ' . $in($v) . " AND contract_upgrade.type = 'upgrade'";
-if ($v = $list($opts['agency'] ?? null))
-    $where[] = 'reservations.agency_id ' . $in($v) . " AND reservations.status = 'accepted'";
-if (($v = $opts['min-area'] ?? '') !== '') { $where[] = "units.$areaCol >= :minArea"; $params[':minArea'] = (float) $v; }
-if (($v = $opts['max-area'] ?? '') !== '') { $where[] = "units.$areaCol <= :maxArea"; $params[':maxArea'] = (float) $v; }
-if ($v = $list($opts['block'] ?? null))    $where[] = 'units.block_id ' . $in($v);
-if ($isList && ($v = $list($opts['extra-config'] ?? null)))
-    $where[] = 'extras.configuration ' . $in($v);
+// Fresh optimizer statistics for both configurations (indexes themselves are unchanged).
+$pdo->query('ANALYZE TABLE items, projects, stages, products, reservations, allocations, contract_upgrades, extras')->fetchAll();
 
-$query = "SELECT $select\n  FROM items units\n$joins\n  WHERE " . implode("\n    AND ", $where)
-       . "\n  ORDER BY units.stock_id_order ASC";
+$measure = array_fill_keys($configs, []);
+$sqls = [];
+for ($i = 0; $i < $warmup + $runs; $i++) {
+    $order = $i % 2 === 0 ? $configs : array_reverse($configs);   // alternate order
+    foreach ($order as $c) {
+        $m = runOnce($pdo, $threadId, $proj, $viewer, $requests[$c]);
+        $sqls[$c] = $GLOBALS['matrix']['query'];
+        if ($i >= $warmup) $measure[$c][] = $m;
+    }
+}
 
-echo "database : $db @ $host:$port\n";
-echo "project  : $project ($projectId, type={$proj['type']})\n";
-echo 'path     : ' . ($isList ? 'list' : "search '$search'") . "\n";
-echo "query    :\n" . preg_replace('/^/m', '  ', $query) . "\n";
-echo "params   : " . json_encode($params, JSON_UNESCAPED_SLASHES) . "\n\n";
+// ---------------------------------------------------------------------------
+// Statistics (Section III.I)
+// ---------------------------------------------------------------------------
+function percentile(array $xs, float $p): float
+{
+    sort($xs);
+    $k = ($p / 100) * (count($xs) - 1);
+    $f = (int) floor($k); $c = (int) ceil($k);
+    return $xs[$f] + ($xs[$c] - $xs[$f]) * ($k - $f);
+}
+$median = static fn (array $xs): float => percentile($xs, 50);
+$col    = static fn (array $ms, string $k): array => array_map(fn ($m) => (float) ($m[$k] ?? 0), $ms);
+
+/**
+ * Wilcoxon signed-rank test on paired samples, normal approximation with
+ * tie-corrected variance (adequate for n >= 20). Returns n, W+, z, two-sided p.
+ */
+function wilcoxon(array $a, array $b): array
+{
+    $d = [];
+    foreach ($a as $i => $x) { $diff = $x - $b[$i]; if (abs($diff) > 1e-12) $d[] = $diff; }
+    $n = count($d);
+    if ($n === 0) return ['n' => 0, 'w_plus' => 0.0, 'z' => 0.0, 'p' => 1.0];
+    $abs = array_map('abs', $d);
+    $idx = array_keys($abs); usort($idx, fn ($i, $j) => $abs[$i] <=> $abs[$j]);
+    $rank = []; $tieTerm = 0.0;
+    for ($i = 0; $i < $n;) {                       // average ranks for ties
+        $j = $i;
+        while ($j + 1 < $n && abs($abs[$idx[$j + 1]] - $abs[$idx[$i]]) < 1e-12) $j++;
+        $r = ($i + 1 + $j + 1) / 2;
+        for ($k = $i; $k <= $j; $k++) $rank[$idx[$k]] = $r;
+        $t = $j - $i + 1; if ($t > 1) $tieTerm += $t ** 3 - $t;
+        $i = $j + 1;
+    }
+    $wPlus = 0.0;
+    foreach ($d as $i => $diff) if ($diff > 0) $wPlus += $rank[$i];
+    $mean = $n * ($n + 1) / 4;
+    $var  = $n * ($n + 1) * (2 * $n + 1) / 24 - $tieTerm / 48;
+    $z    = $var > 0 ? ($wPlus - $mean) / sqrt($var) : 0.0;
+    $p    = 2 * (1 - 0.5 * (1 + erf(abs($z) / M_SQRT2)));
+    return ['n' => $n, 'w_plus' => $wPlus, 'z' => $z, 'p' => $p];
+}
+function erf(float $x): float
+{   // Abramowitz & Stegun 7.1.26, |error| < 1.5e-7
+    $s = $x < 0 ? -1 : 1; $x = abs($x);
+    $t = 1 / (1 + 0.3275911 * $x);
+    $y = 1 - ((((1.061405429 * $t - 1.453152027) * $t + 1.421413741) * $t - 0.284496736) * $t + 0.254829592) * $t * exp(-$x * $x);
+    return $s * $y;
+}
+
+$summary = [];
+foreach ($configs as $c) {
+    $ms = $measure[$c];
+    $summary[$c] = [
+        'runs'           => count($ms),
+        'query_ms_med'   => $median($col($ms, 'query_ms')),
+        'query_ms_p95'   => percentile($col($ms, 'query_ms'), 95),
+        'total_ms_med'   => $median($col($ms, 'total_ms')),
+        'total_ms_p95'   => percentile($col($ms, 'total_ms'), 95),
+        'execute_ms_med' => $median($col($ms, 'execute_ms')),
+        'fetch_ms_med'   => $median($col($ms, 'fetch_ms')),
+        'build_ms_med'   => $median($col($ms, 'build_ms')),
+        'encode_ms_med'  => $median($col($ms, 'encode_ms')),
+        'rows_examined'  => (int) $median($col($ms, 'rows_examined')),
+        'rows_sent'      => (int) $median($col($ms, 'rows_sent')),
+        'units'          => (int) $median($col($ms, 'units')),
+        'scored'         => (int) $median($col($ms, 'scored')),
+        'result'         => (int) $median($col($ms, 'result')),
+        'bytes'          => (int) $median($col($ms, 'bytes')),
+        'tmp_tables'     => (int) $median($col($ms, 'tmp_tables')),
+        'sort_rows'      => (int) $median($col($ms, 'sort_rows')),
+        'peak_mb'        => max($col($ms, 'peak_mb')),
+        'hash'           => $ms[0]['hash'],
+        'stable'         => count(array_unique(array_column($ms, 'hash'))) === 1,
+    ];
+}
+$both = count($configs) === 2;
+$pct  = static fn (float $a, float $b): string => $a == 0.0 ? 'n/a' : sprintf('%+.1f%%', ($b - $a) / $a * 100);
+$tests = [];
+if ($both) {
+    foreach (['query_ms', 'total_ms', 'rows_examined'] as $k) {
+        $tests[$k] = wilcoxon($col($measure['baseline'], $k), $col($measure['proposed'], $k));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Report
+// ---------------------------------------------------------------------------
+$dsn = (getenv('MYSQL_HOST') ?: '127.0.0.1') . ':' . (getenv('MYSQL_PORT') ?: '3307');
+echo "database   : " . (getenv('MYSQL_DATABASE') ?: 'unitledger') . " @ $dsn  (MySQL "
+   . $pdo->getAttribute(PDO::ATTR_SERVER_VERSION) . ", PHP " . PHP_VERSION . ")\n";
+echo "endpoint   : GET /ajax/project/$project/matrix-advance?" . http_build_query($request) . "\n";
+echo "project    : {$proj['title']} ({$proj['id']}, type={$proj['type']}, levels={$proj['levels']})\n";
+echo 'viewer     : ' . ($viewer['isAgent'] ? "agent {$viewer['agency']}" : 'admin') . "\n";
+echo "model      : target class {$model['target_class']}, features " . implode(', ', $model['features']) . "\n";
+echo "predicates : $predMode\n";
+echo "target paths from the tree:\n";
+foreach ($pred['paths'] as $i => $path) {
+    echo '  P' . ($i + 1) . ': ' . implode(' AND ', array_map(fn ($c) => "$c[0] $c[1] $c[2]", $path)) . "\n";
+}
+echo "generated SQL predicate:\n  " . ($pred['sql'] === '' ? '(none: no feature is bounded on every target path)' : str_replace("\n", "\n  ", $pred['sql'])) . "\n";
+echo '  params ' . json_encode($pred['params']) . "\n";
+printf("validity   : %d records, %d in target class, predicate allows %d, wrongly excluded %d  -> %s\n\n",
+    $validity['records'], $validity['model_target'], $validity['predicate_allows'], $validity['wrongly_excluded'],
+    $validity['wrongly_excluded'] === 0 ? 'VALID' : 'INVALID');
+
+echo "units query (proposed configuration; baseline is the same without the ML-derived clause):\n";
+$shown = $sqls['proposed'] ?? $sqls['baseline'];
+echo preg_replace('/^/m', '  ', $shown['sql']) . "\n";
+echo '  params ' . json_encode($shown['params'], JSON_UNESCAPED_SLASHES) . "\n\n";
 
 if (isset($opts['explain'])) {
-    $ex = $pdo->prepare('EXPLAIN ' . $query);
-    $ex->execute($params);
-    $rows = $ex->fetchAll();
-    echo "--- EXPLAIN ---\n";
-    printTable($rows);
-    echo "\n";
+    foreach ($configs as $c) {
+        $ex = $pdo->prepare('EXPLAIN ' . $sqls[$c]['sql']);
+        $ex->execute($sqls[$c]['params']);
+        echo "--- EXPLAIN $c ---\n";
+        printTable($ex->fetchAll());
+        echo "\n";
+    }
 }
 
-// --- run and time -----------------------------------------------------------
-$t0 = hrtime(true);
-$stmt = $pdo->prepare($query);
-$stmt->execute($params);
-$t1 = hrtime(true);
-$rows = $stmt->fetchAll();
-$t2 = hrtime(true);
+printf("--- results: %d warm-up + %d measured requests per configuration, order alternated ---\n", $warmup, $runs);
+$rowsOut = [];
+$metric = static function (string $label, string $key, string $fmt, bool $pctChange = true) use (&$rowsOut, $summary, $configs, $both, $pct) {
+    $r = ['metric' => $label];
+    foreach ($configs as $c) $r[$c] = sprintf($fmt, $summary[$c][$key]);
+    $r['change'] = $both && $pctChange ? $pct((float) $summary['baseline'][$key], (float) $summary['proposed'][$key]) : '';
+    $rowsOut[] = $r;
+};
+$metric('query execution ms (median, Performance Schema)', 'query_ms_med', '%.3f');
+$metric('query execution ms (p95)',                         'query_ms_p95', '%.3f');
+$metric('total processing ms (median, full response)',     'total_ms_med', '%.3f');
+$metric('total processing ms (p95)',                        'total_ms_p95', '%.3f');
+$metric('  execute ms (median)',                            'execute_ms_med', '%.3f');
+$metric('  fetch + hydrate ms (median)',                    'fetch_ms_med', '%.3f');
+$metric('  score + filter + build elements ms (median)',    'build_ms_med', '%.3f');
+$metric('  JSON encode ms (median)',                        'encode_ms_med', '%.3f');
+$metric('rows examined by MySQL',                           'rows_examined', '%d');
+$metric('rows returned to application (joined)',            'rows_sent', '%d');
+$metric('units hydrated',                                   'units', '%d');
+$metric('records scored by the model',                      'scored', '%d');
+$metric('elements in response',                             'result', '%d');
+$metric('response bytes',                                   'bytes', '%d');
+$metric('temp tables created',                              'tmp_tables', '%d', false);
+$metric('rows sorted (filesort)',                           'sort_rows', '%d');
+$metric('peak PHP memory MB',                               'peak_mb', '%.1f');
+printTable($rowsOut);
+echo "\n";
 
-if (isset($opts['show'])) {
-    printTable($rows);
-    echo "\n";
+foreach ($configs as $c) {
+    printf("%-9s element-id hash %s  (%s across runs)\n", $c, substr($summary[$c]['hash'], 0, 16),
+        $summary[$c]['stable'] ? 'stable' : 'UNSTABLE');
+}
+if ($both) {
+    $same = $summary['baseline']['hash'] === $summary['proposed']['hash'];
+    echo 'correctness: ' . ($same ? 'proposed returns exactly the baseline element set' : 'MISMATCH between configurations') . "\n";
+    echo "\nWilcoxon signed-rank (paired, n=$runs, alpha 0.05):\n";
+    foreach ($tests as $k => $t) {
+        printf("  %-14s W+=%-8.1f z=%-7.3f p=%-10.2e %s\n", $k, $t['w_plus'], $t['z'], $t['p'],
+            $t['n'] === 0 ? 'no differences' : ($t['p'] < 0.05 ? 'significant' : 'not significant'));
+    }
 }
 
-$ms = static fn (int $ns): string => number_format($ns / 1e6, 2) . ' ms';
-echo "--- timing ---\n";
-printf("rows    : %d\n", count($rows));
-printf("execute : %s  (prepare + execute, server-side work)\n", $ms($t1 - $t0));
-printf("fetch   : %s  (transfer + hydrate %d rows)\n", $ms($t2 - $t1), count($rows));
-printf("total   : %s\n", $ms($t2 - $t0));
-printf("memory  : %.1f MB peak\n", memory_get_peak_usage(true) / 1048576);
+if (isset($opts['json'])) {
+    echo "\n" . json_encode([
+        'project' => $project, 'project_id' => $proj['id'], 'request' => $request, 'viewer' => $viewer,
+        'predicates' => $predMode, 'predicate_sql' => $pred['sql'], 'predicate_params' => $pred['params'],
+        'queries' => $sqls, 'validity' => $validity, 'warmup' => $warmup, 'runs' => $runs,
+        'summary' => $summary, 'tests' => $tests, 'measurements' => $measure,
+    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+}
 
-/** Print rows as a simple aligned text table (columns truncated to 40 chars). */
+/** Print rows as a simple aligned text table (cells truncated to 48 chars). */
 function printTable(array $rows): void
 {
     if ($rows === []) { echo "(empty set)\n"; return; }
     $cols = array_keys($rows[0]);
-    $cell = static fn ($v): string => mb_strimwidth($v === null ? 'NULL' : (string) $v, 0, 40, '…');
+    $cell = static fn ($v): string => mb_strimwidth($v === null ? 'NULL' : (string) $v, 0, 48, '…');
     $width = array_combine($cols, array_map('mb_strlen', $cols));
     foreach ($rows as $r) foreach ($cols as $c) $width[$c] = max($width[$c], mb_strlen($cell($r[$c])));
     $line = '+' . implode('+', array_map(fn ($c) => str_repeat('-', $width[$c] + 2), $cols)) . '+';
